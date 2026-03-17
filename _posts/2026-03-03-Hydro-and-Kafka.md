@@ -1,4 +1,0 @@
-## Hydro and Kafka
-
-TODO
-

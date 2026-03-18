@@ -36,7 +36,7 @@ aws kafka get-bootstrap-brokers --cluster-arn <MSK_CLUSTER_ARN>
 
 这个配置涉及**跨 AWS 账号的权限问题**。
 
-假设 Kafka 集群属于账号 A（`888892762448`），消费者服务属于账号 B（`567418462583`）。账号 B 的服务没有直接读取账号 A 的 Kafka Topic 的权限，解决方案是使用 **IAM Role Assume（角色借用）**：
+假设 Kafka 集群属于账号 A（`8888`），消费者服务属于账号 B（`6666`）。账号 B 的服务没有直接读取账号 A 的 Kafka Topic 的权限，解决方案是使用 **IAM Role Assume（角色借用）**：
 
 - 账号 A 创建一个 IAM Role，声明允许账号 B 的服务"借用"（assume）这个 Role
 - 账号 B 的服务运行时，借用账号 A 的这个 Role，获得对应的读权限
@@ -153,7 +153,7 @@ props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);  // 集群
 props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);                     // 消费组 ID
 props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, CloudEventDeserializer.class);
-props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");          // 新消费组首次启动时从最早消息开始读
+// auto.offset.reset 未显式设置，沿用 Kafka 默认值 latest
 // IAM 认证相关配置
 props.put("security.protocol", "SASL_SSL");
 props.put("sasl.mechanism", "AWS_MSK_IAM");
@@ -169,7 +169,15 @@ props.put("sasl.mechanism", "AWS_MSK_IAM");
 | `earliest` | 从该分区**最早**的消息开始读，确保不漏任何历史消息 |
 | `latest` | 从该分区**最新**的位置开始读，只消费启动后新进来的消息 |
 
-大多数消费者场景选择 `earliest`，以防新部署时遗漏掉在启动前已经产生的消息。如果只关心"从现在起"的实时消息，才使用 `latest`。
+**项目中的实际值：`latest`（Kafka 客户端原生默认值）**
+
+与 `enable.auto.commit` 不同，Spring Kafka **不会覆盖**这个配置。项目中没有显式设置它，因此直接沿用 Kafka 客户端的原生默认值 `latest`：当某个 consumer group 第一次消费某个 topic（没有已提交的 offset）时，从最新的消息开始消费，不会读取历史消息。
+
+如果需要新消费组从头消费，需要在 `KafkaConsumerConfig` 中**显式配置**：
+
+```java
+props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+```
 
 > 注意：这个配置只在消费组**没有已提交 Offset** 时生效。一旦该消费组提交过 Offset，重启后会从上次的 Offset 继续，`auto.offset.reset` 不再起作用。
 
@@ -224,7 +232,9 @@ private CommonErrorHandler buildErrorHandler() {
 
 ### Offset 何时提交
 
-Spring Kafka 默认将底层的 `enable.auto.commit` 设为 `false`，由框架自己控制 Offset 的提交时机，而不是让 Kafka 客户端定期自动提交。
+Kafka 客户端原生的 `enable.auto.commit` 默认值是 `true`，但 Spring Kafka 会**主动将其覆盖为 `false`**，由框架自己控制 Offset 的提交时机，而不是让 Kafka 客户端定期自动提交。
+
+原因在于：Spring Kafka 用自己的 `AckMode`（默认 `BATCH`）来管理 offset 提交，如果 Kafka 客户端的自动提交也在运行，两者会冲突，所以 Spring Kafka 在内部主动接管了这个行为。即使项目代码里没有显式设置 `enable.auto.commit=false`，Spring Kafka 也会自动处理。
 
 默认行为（`AckMode.BATCH`）：
 
@@ -343,7 +353,7 @@ props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000);  // 最长允许 
 | `ConcurrentKafkaListenerContainerFactory` | 创建并管理消费者线程的工厂 |
 | `FixedBackOff` + DLQ | 重试失败后将消息转移到死信队列的容错策略 |
 | Offset 提交（AckMode） | 消息处理完成后由 Spring Kafka 自动提交 Offset，保证 at-least-once |
-| `auto.offset.reset` | 新消费组首次启动时的读取起点（earliest / latest） |
+| `auto.offset.reset` | 新消费组首次启动时的读取起点（项目未显式设置，沿用 Kafka 原生默认值 `latest`） |
 | `setConcurrency` | 单实例内的并发消费线程数 |
 | `ConsumerRecord` | 封装消息体和元数据的对象 |
 | `groupId` + 多实例 | 通过多个服务实例并行消费同一 Topic |

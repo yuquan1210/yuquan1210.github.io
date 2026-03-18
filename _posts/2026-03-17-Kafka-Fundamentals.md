@@ -143,6 +143,44 @@ risk-control-group  → 风控分析
 data-sync-group     → 数据仓库同步
 ```
 
+### Rebalance：消费者组的动态调整
+
+**Rebalance（再平衡）** 是指消费者组在成员数量发生变化时，由 Group Coordinator 重新分配各消费者与分区之间对应关系的过程。触发时机包括：
+
+- 有新的消费者加入组
+- 某个消费者主动退出或崩溃
+- 消费者超时未响应，被 Group Coordinator 判定为"失联"
+
+需要特别注意的是：**Rebalance 并不只是把失联消费者的分区"转给别人"，而是对整个消费者组的所有分区重新做一次全量分配**。例如：
+
+```
+原状态：
+Consumer A → Partition 0, 1
+Consumer B → Partition 2, 3
+Consumer C → Partition 4
+
+Consumer B 超时失联，触发 Rebalance
+
+Rebalance 后（2 个消费者重新均分 5 个分区）：
+Consumer A → Partition 0, 1, 2
+Consumer C → Partition 3, 4
+```
+
+Rebalance 期间整个消费者组会**暂停消费**，等所有成员完成分区重分配后才恢复正常，因此应尽量避免不必要的 Rebalance。
+
+#### 留意 max.poll.interval.ms
+
+Kafka 要求消费者必须在 `max.poll.interval.ms` 时间内（默认 5 分钟）完成当前批次的处理，并发起下一次 poll（拉取请求）。如果超时，Group Coordinator 会认为该消费者失联，将其踢出消费者组并触发 Rebalance——其原本负责的分区会在 Rebalance 后被重新分配给组内仍然存活的其他消费者。
+
+在实际项目中，如果消费逻辑涉及较慢的下游调用（例如同步调用外部 API），需要结合 `max.poll.records`（每次 poll 拉取的最大消息数，默认 500）一起调整，避免单批处理耗时过长：
+
+```java
+props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 10);           // 每次只拉取 10 条，减少单批处理时间
+props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000);  // 最长允许 5 分钟处理完一批
+```
+
+两个参数配合的逻辑很直接：**每批消息少拉一点，每批给更多时间处理**，防止因处理不过来而触发非预期的 Rebalance。
+
 ---
 
 ## 五、Offset：消费进度的"书签"
@@ -259,6 +297,7 @@ Kafka 分区的数据复制机制与 Raft 有几处重要不同：
 | 副本 & ISR | 容错保障，只有同步充分的副本才能选为 Leader |
 | Producer / Consumer | 客户端驱动，生产者推，消费者拉 |
 | Consumer Group | 并行消费，同一分区同时只属于组内一个消费者 |
+| Rebalance | 消费者组成员变化时触发，全量重分配所有分区；`max.poll.interval.ms` 超时是常见触发原因 |
 | Offset | 消费进度书签，至少一次语义，确保幂等处理 |
 | CloudEvents | 标准化事件格式，提升跨系统集成效率 |
 | KRaft | Kafka 的一致性元数据管理，基于 Raft 协议 |

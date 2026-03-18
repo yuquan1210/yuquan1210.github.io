@@ -38,29 +38,47 @@ CloudFormation 执行（实际创建/更新 AWS 资源）
 
 ## 二、Topic 配置详解
 
-Kafka Topic 通过一份 YAML manifest 来声明式地定义。下面是一个简化的 `incoming-lead-topic` 配置，以此为例逐条介绍各项配置的含义：
+HydroTopic Manifest 是一个标准的 Kubernetes CRD（自定义资源定义）。团队通过声明式的 YAML 定义一个 Kafka Topic 的全部属性，`hydro-topic-service` 读取后验证、补全，并驱动下游资源创建。以下是 `incoming-lead-topic-dev` 的真实 manifest：
 
 ```yaml
-hydro_env: hydro-dev
-hydro_metadata:
-  owner: lead-filtering
-  description: "Incoming lead events"
-
-partitions: 3
-replication: 3
-
-kafka_config:
-  cleanup.policy: delete
-  retention.ms: 604800000   # 7 天
-
-permissions:
-  - name: incoming-lead-readonly
-    access_level: topic-read
-    principals:
-      - principal_type: consumer-app
-        arn: arn:aws:iam::6666:role/application/lead-store-role-ap-southeast-2
-
-retired: false
+apiVersion: service.copilot/v1
+kind: HydroTopic
+metadata:
+  name: incoming-lead-topic-dev
+  namespace: aws-account-6666   # namespace 对应该 Topic 所属的 AWS 账号 ID
+spec:
+  hydro_env: hydro-dev
+  hydro_metadata:
+    owner: finx-lead-lords
+    personal_information: personal-information
+  topic_name:
+    domain: lead-engine
+    product: incoming-lead
+    topic_type: pii
+    environment: dev
+  partitions: 3
+  kafka_config:
+    cleanup.policy: delete
+    retention.ms: 259200000   # 3 天
+  permissions:
+    incoming-lead-readonly:
+      access_level:
+        - topic-read
+      principals:
+        lead-store:
+          principal_type: consumer-app
+          arn: arn:aws:iam::6666:role/application/lead-store-role-ap-southeast-2
+    incoming-lead-readwrite:
+      access_level:
+        - topic-read
+        - topic-write
+      principals:
+        enquiry-api:
+          principal_type: producer-app
+          arn: arn:aws:iam::6666:role/application/enquiry-api-role-ap-southeast-2
+        incoming-lead-replay:
+          principal_type: producer-app
+          arn: arn:aws:iam::6666:role/application/incoming-lead-replay-role-ap-southeast-2
 ```
 
 下面逐项拆解。
@@ -73,9 +91,38 @@ retired: false
 /kafka/hydro/hydro-dev/{cluster}/...
 ```
 
-### `hydro_metadata`：标签式元数据
+### `hydro_metadata`：元数据与数据治理标签
 
-类似于标签（Tag），用于标注所有者、描述等信息，方便平台管理和账单归因。
+`hydro_metadata` 不只是描述性字段，它的内容会被服务解析，自动生成一套 `data-asset:*` 数据治理标签，附加到 CloudFormation Stack 和所有下游资源上：
+
+| 字段 | 作用 |
+|------|------|
+| `owner` | 映射为 `data-asset:technical_owner`，标注资源归属团队 |
+| `personal_information: personal-information` | Topic 含个人信息（PII），触发 `data-asset:contains_pi: yes`、`data-asset:pi_category: basic_personal_information` |
+| `personal_information: none-personal-information` | Topic 不含个人信息，`data-asset:contains_pi: no` |
+
+此外，`hydro_env` 中含 `dev` 字样时，服务会自动补全 `data-asset:development_lifecycle: development`，区分数据资产的环境归属。
+
+---
+
+### `topic_name`：Topic 全名的推导规则
+
+Topic 名称通过 `topic_name` 下的多个字段**拼接推导**，而非直接写死一个字符串：
+
+| 字段 | 值 | 说明 |
+|------|----|------|
+| `domain` | `lead-engine` | 数据域 |
+| `product` | `incoming-lead` | 产品/数据集名称 |
+| `topic_type` | `pii` | 数据类型标记，各域有各自允许的合法值 |
+| `environment` | `dev` | 环境 |
+
+拼接规则为 `{domain}.{product}.{topic_type}.{environment}`（`null` 字段直接跳过），最终 Topic 全名为：
+
+```
+lead-engine.incoming-lead.pii.dev
+```
+
+这个命名规范保证了 Topic 名称的**一致性和可读性**，运维人员一眼就能识别数据域、内容和环境归属。`topic_type` 的合法值由各域的 `policy_config.yaml` 定义（例如 `pii` 是 `lead-engine` 域特别允许的值）。
 
 ---
 
@@ -96,9 +143,7 @@ partitions: 3
 
 ### 副本因子（`replication`）
 
-```yaml
-replication: 3
-```
+Hydro 平台将副本因子**硬编码为 3**，不对用户开放配置——这个参数不会出现在 manifest 中，由 `hydro-topic-service` 在构建 CloudFormation 参数时自动注入。
 
 副本（Replica）是 Kafka 的**容错机制**——每条消息被同时存储在 3 个不同的 Broker 节点上。即使某个 Broker 宕机，数据依然完整。
 
@@ -164,29 +209,75 @@ kafka_config:
 
 ---
 
+### 平台自动补全的其他配置
+
+除了 `retention.bytes` 和 Tiered Storage 相关参数，`hydro-topic-service` 在将配置下发给 Kafka 前，还会自动补全以下参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max.message.bytes` | `5242880`（5 MB） | 单条消息的大小上限 |
+| `message.timestamp.before.max.ms` | `315400000000`（约 10 年） | 消息时间戳允许早于当前时间的最大范围 |
+| `message.timestamp.after.max.ms` | `86400000`（24 小时） | 消息时间戳允许晚于当前时间的最大范围，防止客户端时钟偏差 |
+
+未启用 Tiered Storage 时，`local.retention.ms` 和 `local.retention.bytes` 会被设为 `-2`，这是 MSK 的**占位值**，表示该参数不适用，不会生效。
+
+---
+
 ## 三、IAM 权限模型
 
 Kafka 的消息读写本质上是通过网络直连 MSK Broker，需要在 **AWS IAM 层面**控制谁能连接、读写哪些 Topic。
 
-Hydro 平台通过 `permissions` 字段统一声明式地管理这套权限：
+Hydro 平台通过 `permissions` 字段统一声明式地管理这套权限。`incoming-lead-topic` 配置了两个权限组：
 
 ```yaml
 permissions:
-  - name: incoming-lead-readonly
-    access_level: topic-read
+  incoming-lead-readonly:         # 权限组名（只读）
+    access_level:
+      - topic-read
     principals:
-      - principal_type: consumer-app
+      lead-store:
+        principal_type: consumer-app
         arn: arn:aws:iam::6666:role/application/lead-store-role-ap-southeast-2
+  incoming-lead-readwrite:        # 权限组名（读写）
+    access_level:
+      - topic-read
+      - topic-write
+    principals:
+      enquiry-api:
+        principal_type: producer-app
+        arn: arn:aws:iam::6666:role/application/enquiry-api-role-ap-southeast-2
+      incoming-lead-replay:
+        principal_type: producer-app
+        arn: arn:aws:iam::6666:role/application/incoming-lead-replay-role-ap-southeast-2
 ```
+
+`incoming-lead-readonly` 供消费者 `lead-store` 使用（只读）；`incoming-lead-readwrite` 供两个生产者 `enquiry-api` 和 `incoming-lead-replay` 使用（读写）。生产者同时需要 `topic-read` 是因为 Kafka 生产者在事务、幂等写入等操作中也需要读取 Topic 的元数据。
 
 ### 字段说明
 
 | 字段 | 说明 |
 |------|------|
-| `name` | 权限组名，平台会与集群 ID 和 Topic Hash 拼接，生成 IAM Role 名，例如 `hydro-dev-27efb0e-incoming-lead-readonly` |
+| 权限组名（如 `incoming-lead-readonly`） | 平台会与集群 ID 和 Topic 名哈希拼接，生成最终 IAM Role 名 |
 | `access_level` | 可选 `topic-read`、`topic-write`、`topics-describe`，决定附加哪些 MSK 操作权限 |
 | `principal_type` | `consumer-app` 或 `producer-app`，标注应用角色，配合 `access_level` 确定 IAM Policy 内容 |
 | `arn` | 应用运行时使用的 IAM Role ARN，Trust Policy 会允许这个 ARN 执行 `sts:AssumeRole` |
+
+### IAM Role 命名规则
+
+生成的 IAM Role 名遵循固定格式：
+
+```
+{cluster_id}-{sha256(topic_name)[:7]}-{permission_group_name}
+```
+
+以 `incoming-lead-readonly` 为例：
+- `cluster_id` = `hydro-dev`
+- `sha256("lead-engine.incoming-lead.pii.dev")[:7]` = `27efb0e`
+- 最终 IAM Role 名 = `hydro-dev-27efb0e-incoming-lead-readonly`
+
+CloudFormation Stack 的命名规则与此类似：`{cluster_id}-topic-{sha256(topic_name)[:7]}`，即 `hydro-dev-topic-27efb0e`。
+
+使用 Topic 全名的哈希前缀，是为了在 IAM 命名长度限制内保证唯一性，同时让 IAM Role、Stack 等资源在 AWS Console 里保持关联可查。
 
 ### 生成的 IAM 资源结构
 
@@ -214,9 +305,9 @@ AWS::IAM::ManagedPolicy
 
 ### 跨账号 AssumeRole
 
-`lead-store` 服务（AWS 账号 `6666`）和 Kafka 集群（AWS 账号 `8888`）在**不同的账号**里。
+`lead-store` 服务运行在 AWS 账号 `6666`（业务账号），而 Kafka 集群和相关 IAM 资源由 Hydro 平台账号（`8888`）管理，两者在**不同的账号**里。
 
-平台生成的 IAM Role（`hydro-dev-27efb0e-incoming-lead-readonly`）的 **Trust Policy** 会允许 `lead-store` 的 Role ARN 来 `sts:AssumeRole`。运行时，`lead-store` 先 Assume 这个跨账号 Role，再用临时凭证连接 MSK 读取消息。
+CloudFormation 部署时，生成的 IAM Role（如 `hydro-dev-27efb0e-incoming-lead-readonly`）被创建在 Hydro 平台账号内，其 **Trust Policy** 允许 `arn:aws:iam::6666:role/application/lead-store-role-ap-southeast-2` 执行 `sts:AssumeRole`。运行时，`lead-store` 先 Assume 这个跨账号 Role 获得临时凭证，再用该凭证连接 MSK 读取消息。
 
 ### 顺带一提：两种 IAM Policy 类型
 
@@ -306,16 +397,20 @@ AWS 资源（MSK Topic、IAM Role/Policy、CloudWatch Alarm 等）
 
 ### 一次 Topic 创建会生成哪些资源
 
-`copilot-hydro-topic-service` 在一次部署中会创建和管理以下资源：
+以 `incoming-lead-topic-dev` 为例，`hydro-topic-service` 驱动 CDK 合成的 CloudFormation Stack（名为 `hydro-dev-topic-27efb0e`）包含以下资源：
 
 ```
-copilot-hydro-topic-service 直接管理
-  ├─ MSK Kafka Topic          ← CloudFormation（via Custom Resource + Lambda）
-  ├─ IAM Role + Policy        ← CloudFormation（permissions 配置对应的资源）
-  └─ CloudWatch Alarm         ← CloudFormation（Topic 的可观测性告警）
+CloudFormation Stack: hydro-dev-topic-27efb0e
+  ├─ Custom::Kafka_Topic         × 1   ← 实际 Kafka Topic（via Lambda + AdminClient）
+  ├─ AWS::IAM::Role              × 3   ← Lambda 执行角色 × 1 + 权限访问角色 × 2
+  ├─ AWS::IAM::Policy            × 2   ← Lambda 执行策略（内联，随角色删除）
+  ├─ AWS::IAM::ManagedPolicy     × 1   ← Topic 读写权限策略（托管，可被多 Role 共享）
+  └─ AWS::Lambda::Function       × 2   ← Provider Lambda（业务逻辑）+ OnEvent Lambda（CF 协议层）
 
-可选：S3 Sink Connector
-  └─ 由 copilot-hydro-connect-service 管理（依赖 HydroConnect，实现 Topic → S3 备份）
+可选：HydroConnect（S3 备份）
+  └─ 由 copilot-hydro-connect-service 管理
+  └─ 仅在 hydro-prod 环境启用（由平台常量 S3_BACKUP_ALLOWED_ENVS 控制）
+  └─ hydro-dev 环境不会生成此子资源
 ```
 
 ### 部署操作步骤
@@ -350,11 +445,13 @@ retired: true
 
 | 层面 | 技术/工具 |
 |------|-----------|
-| Topic 声明 | YAML Manifest（partitions、replication、cleanup.policy、retention、permissions） |
-| 权限管理 | AWS IAM（ManagedPolicy、Trust Policy、跨账号 AssumeRole） |
+| Topic 声明 | Kubernetes CRD（HydroTopic Manifest）：partitions、cleanup.policy、retention、permissions |
+| Topic 命名 | 多字段拼接推导：`{domain}.{product}.{topic_type}.{environment}` |
+| 数据治理标签 | `hydro_metadata` → `data-asset:*` 标签（PII 声明、环境、所有者等自动生成） |
+| 权限管理 | AWS IAM（ManagedPolicy、Trust Policy、跨账号 AssumeRole、Topic 名哈希命名） |
 | 创建机制 | CloudFormation Custom Resource + Lambda（Kafka AdminClient） |
 | 基础设施管理 | AWS CDK → CloudFormation |
 | 自助部署流程 | CoPilot + Metacontroller + hydro-topic-service + rea-copilot-cdk |
-| 长期存储 | Tiered Storage（本地 EBS 热数据 + S3 冷数据） |
+| 长期存储 | Tiered Storage（本地 EBS 热数据 + S3 冷数据，仅 hydro-prod 支持 S3 备份） |
 
 这套体系的核心思路是**声明式管理 + 平台统一治理**：开发者只需关心"我要什么样的 Topic"，底层的资源编排、权限配置、告警搭建全部由平台自动完成。这与前一篇介绍的 Spring Boot 消费者配置形成互补——消费者侧关注"怎么消费"，平台侧关注"资源是否就绪"。

@@ -43,6 +43,55 @@ aws kafka get-bootstrap-brokers --cluster-arn <MSK_CLUSTER_ARN>
 
 `incoming_lead_topic_role_arn` 就是这个属于账号 A 的 IAM Role 的 ARN。
 
+### 深入：服务自身 Role 的两层授权
+
+以 `lead-store` 的 IAM Role 为例，解释 assumeRole 如何工作：
+
+```yaml
+# iam-role-stack.yml（节选）
+
+# --- 第一层：信任策略（Trust Policy）---
+# 回答：谁可以 assume 这个 Role？
+AssumeRolePolicyDocument:
+  Statement:
+    - Effect: Allow
+      Principal:
+        Service: ecs-tasks.amazonaws.com   # ECS Tasks 服务可以 assume 这个 Role
+      Action: sts:AssumeRole
+
+# --- 第二层：权限策略（Permission Policy）---
+# 回答：这个 Role 自身能做什么？
+- Effect: Allow
+  Action:
+    - sts:AssumeRole                       # 这个 Role 可以去 assume 其他 Role
+  Resource: '*'
+```
+
+这两处 `sts:AssumeRole` 虽然动作名称相同，但含义完全不同：
+
+| | 信任策略（Trust Policy）| 权限策略（Permission Policy）|
+|---|---|---|
+| **位置** | `AssumeRolePolicyDocument` | Role 附加的 IAM Policy |
+| **方向** | 谁能 assume **这个** Role | 这个 Role 能 assume **哪些** Role |
+| **主体** | ECS Tasks 服务 | 这个 Role 本身 |
+| **作用** | 使 ECS Task 可以使用此 Role | 使此 Role 可以扮演其他 Role |
+
+**信任策略**是前提条件：它授权 AWS ECS 服务在启动 Task 时，以这个 `lead-store` Role 的身份运行，从而让 Task 内的应用程序获得该 Role 所拥有的所有权限（读 KMS、写 SQS、推 CloudWatch 指标等）。
+
+**权限策略中的 `sts:AssumeRole`** 是跨账号访问的钥匙：正因为这条授权，`lead-store` 服务才能在运行时调用 `sts:AssumeRole` API，临时借用账号 A 的 Kafka Topic Role，获取该 Topic 的读取凭证。
+
+两者协同，构成了完整的跨账号访问链路：
+
+```
+AWS ECS 服务（启动 Task）
+  └─ [信任策略] → assume lead-store Role
+       └─ lead-store 应用（运行中）
+            └─ [权限策略 sts:AssumeRole] → assume 账号 A 的 Kafka Topic Role
+                 └─ 获取临时凭证 → 读取账号 A 的 Kafka Topic
+```
+
+在hydro系统中，hydro-dev账号配置 trusy policy 允许 lead-store （临时）使用 hydro-dev 拥有的role，lead-store 自身也需要设置 Permission Policy 允许自己去临时使用他人的role
+
 ---
 
 ## 二、`KafkaConsumerConfig`：配置消费者工厂
